@@ -42,6 +42,13 @@ namespace SpaceStrategy.Domain
         public bool Travelling;
         public TransferMode Mode;
         public double TravelProgress;
+        public int[] Path = Array.Empty<int>();
+        public int LegIndex;
+        public double LegProgress;
+        public int ActiveRoute => Travelling && Mode == TransferMode.Route
+            ? Math.Min(Path[LegIndex], Path[LegIndex + 1]) : -1;
+        public int LegOrigin => Travelling && Mode == TransferMode.Route ? Path[LegIndex] : Origin;
+        public int LegDestination => Travelling && Mode == TransferMode.Route ? Path[LegIndex + 1] : Destination;
         public double Organization = 100;
         public double Fuel = 100;
         public double SupplyStock = 120;
@@ -60,8 +67,8 @@ namespace SpaceStrategy.Domain
             new PlanetState { Name = "Бастион", Role = "Передовая база", Capacity = 40, Efficiency = 0.65, Tempo = 0.7, RawStock = 60, MaxRawStock = 80 }
         };
         public readonly RouteState[] Routes = {
-            new RouteState { Name = "Эридан IV → Земля", Capacity = 100 },
-            new RouteState { Name = "Земля → Бастион", Capacity = 70 }
+            new RouteState { Name = "Эридан IV ↔ Земля", Capacity = 100 },
+            new RouteState { Name = "Земля ↔ Бастион", Capacity = 70 }
         };
         public readonly FleetState Fleet = new FleetState();
         public const double ShipCost = 2000;
@@ -86,11 +93,12 @@ namespace SpaceStrategy.Domain
             double bastionOrder = Planets[2].RawNeeded * (Planets[2].RawStock < Planets[2].MaxRawStock - 0.001 ? 1.1 : 1);
             double rawDemand = earthOrder + bastionOrder;
             double extractionRatio = rawDemand > 0 ? Math.Min(1, MiningOutput / rawDemand) : 1;
-            Routes[0].Demand = rawDemand + 20;
-            bool remoteFleet = Fleet.Travelling || Fleet.Location == 2;
             double supplyOrder = Fleet.Demand * (Fleet.SupplyStock < Fleet.MaxSupplyStock - 0.001 ? 1.15 : 1);
-            Routes[1].Demand = bastionOrder + 12 + (remoteFleet ? supplyOrder : 0)
-                + (Fleet.Travelling && Fleet.Mode == TransferMode.Route ? 25 : 0);
+            int supplyRoute = FleetSupplyRoute;
+            Routes[0].Demand = rawDemand + 20 + (supplyRoute == 0 ? supplyOrder : 0)
+                + (Fleet.ActiveRoute == 0 ? 25 : 0);
+            Routes[1].Demand = bastionOrder + 12 + (supplyRoute == 1 ? supplyOrder : 0)
+                + (Fleet.ActiveRoute == 1 ? 25 : 0);
             Planets[1].RawDelivered = earthOrder * extractionRatio * Routes[0].DeliveryRatio;
             Planets[2].RawDelivered = bastionOrder * extractionRatio * Routes[0].DeliveryRatio * Routes[1].DeliveryRatio;
             for (int i = 1; i < 3; i++)
@@ -101,7 +109,9 @@ namespace SpaceStrategy.Domain
             }
             // Spare output above fleet upkeep fills the depot; shipbuilding uses the remainder.
             double supplyProductionRatio = Math.Min(1, Planets[1].Output / (Fleet.Demand * 0.7));
-            Fleet.NetworkSupply = supplyOrder * supplyProductionRatio * (remoteFleet ? Routes[1].DeliveryRatio : 1);
+            double delivery = Fleet.Travelling && Fleet.Mode == TransferMode.Hyperjump ? 0
+                : supplyRoute >= 0 ? Routes[supplyRoute].DeliveryRatio : 1;
+            Fleet.NetworkSupply = supplyOrder * supplyProductionRatio * delivery;
             Fleet.SupplyRatio = Fleet.SupplyStock > 0.001 ? 1 : Ratio(Fleet.NetworkSupply, Fleet.Demand);
         }
 
@@ -151,10 +161,24 @@ namespace SpaceStrategy.Domain
             }
             if (Fleet.Travelling)
             {
-                double speed = Fleet.Mode == TransferMode.Hyperjump ? 1.0 / 2 : Routes[1].DeliveryRatio / 6;
-                Fleet.TravelProgress = Math.Min(1, Fleet.TravelProgress + speed * dt);
-                if (Fleet.TravelProgress >= 1)
+                if (Fleet.Mode == TransferMode.Hyperjump)
+                    Fleet.TravelProgress = Math.Min(1, Fleet.TravelProgress + dt / 2);
+                else
                 {
+                    Fleet.LegProgress = Math.Min(1, Fleet.LegProgress + Routes[Fleet.ActiveRoute].DeliveryRatio * dt / 6);
+                    if (Fleet.LegProgress >= 1 - 0.000001)
+                    {
+                        Fleet.Location = Fleet.LegDestination;
+                        Fleet.LegIndex++;
+                        Fleet.LegProgress = 0;
+                        if (Fleet.LegIndex < Fleet.Path.Length - 1)
+                            LastEvent = "Флот проходит через " + Planets[Fleet.Location].Name + "; следующий участок — " + Routes[Fleet.ActiveRoute].Name + ".";
+                    }
+                    Fleet.TravelProgress = (Fleet.LegIndex + Fleet.LegProgress) / (Fleet.Path.Length - 1);
+                }
+                if (Fleet.TravelProgress >= 1 - 0.000001)
+                {
+                    Fleet.TravelProgress = 1;
                     Fleet.Location = Fleet.Destination;
                     Fleet.Travelling = false;
                     LastEvent = "Флот прибыл: " + Planets[Fleet.Location].Name + ".";
@@ -173,18 +197,46 @@ namespace SpaceStrategy.Domain
             return true;
         }
 
-        public bool Transfer(TransferMode mode)
+        public double TransferFuelCost(int destination, TransferMode mode) => mode == TransferMode.Hyperjump
+            ? 30 : Math.Abs(destination - Fleet.Location) * 10;
+
+        public double MinimumTravelHours(int destination, TransferMode mode) => mode == TransferMode.Hyperjump
+            ? 2 : Math.Abs(destination - Fleet.Location) * 6;
+
+        private int FleetSupplyRoute => Fleet.Travelling ? (Fleet.Mode == TransferMode.Route ? Fleet.ActiveRoute : -1)
+            : Fleet.Location == 0 ? 0 : Fleet.Location == 2 ? 1 : -1;
+
+        public string TransferBlockReason(int destination, TransferMode mode)
         {
-            double fuelCost = mode == TransferMode.Hyperjump ? 30 : 10;
-            if (ShipQueued || Fleet.Travelling || Fleet.Fuel < fuelCost || (mode == TransferMode.Route && !Routes[1].Open)) return false;
+            if (destination < 0 || destination >= Planets.Length) return "Выберите существующую планету.";
+            if (Fleet.Travelling) return "Флот уже в пути.";
+            if (ShipQueued) return "Дождитесь завершения строительства на верфи.";
+            if (destination == Fleet.Location) return "Флот уже у выбранной планеты.";
+            if (Fleet.Fuel < TransferFuelCost(destination, mode)) return "Не хватает топлива.";
+            if (mode == TransferMode.Route)
+                for (int route = Math.Min(Fleet.Location, destination); route < Math.Max(Fleet.Location, destination); route++)
+                    if (Routes[route].EffectiveCapacity <= 0) return "Недоступен участок: " + Routes[route].Name + ".";
+            return null;
+        }
+
+        public bool Transfer(int destination, TransferMode mode)
+        {
+            if (TransferBlockReason(destination, mode) != null) return false;
+            double fuelCost = TransferFuelCost(destination, mode);
             Fleet.Origin = Fleet.Location;
-            Fleet.Destination = Fleet.Location == 1 ? 2 : 1;
+            Fleet.Destination = destination;
+            Fleet.Path = new int[Math.Abs(destination - Fleet.Location) + 1];
+            int direction = Math.Sign(destination - Fleet.Location);
+            for (int i = 0; i < Fleet.Path.Length; i++) Fleet.Path[i] = Fleet.Location + i * direction;
+            Fleet.LegIndex = 0;
+            Fleet.LegProgress = 0;
             Fleet.Mode = mode;
             Fleet.TravelProgress = 0;
             Fleet.Travelling = true;
             Fleet.Fuel -= fuelCost;
             if (mode == TransferMode.Hyperjump) Fleet.Organization = Math.Max(0, Fleet.Organization - 35);
-            LastEvent = mode == TransferMode.Hyperjump ? "Гиперпрыжок: 2 часа, −30 топлива, −35 организации." : "Переброска: от 6 часов, −10 топлива. Флот занимает 25 единиц маршрута.";
+            LastEvent = mode == TransferMode.Hyperjump ? "Гиперпрыжок к " + Planets[destination].Name + ": 2 часа, −30 топлива, −35 организации; в пути снабжение только из резерва."
+                : "Переброска к " + Planets[destination].Name + ": от " + MinimumTravelHours(destination, mode) + " часов, −" + fuelCost + " топлива; 25 мощности на текущем участке.";
             Recalculate();
             return true;
         }
@@ -192,9 +244,14 @@ namespace SpaceStrategy.Domain
         public string FleetCause()
         {
             if (Fleet.NetworkSupply >= Fleet.Demand) return "Поставки покрывают расход. Резерв пополняется.";
+            if (Fleet.Travelling && Fleet.Mode == TransferMode.Hyperjump) return "В гиперпрыжке поставок нет; расходуется бортовой резерв.";
             string cause = "Недостаточно промышленного выпуска Земли.";
-            if ((Fleet.Travelling || Fleet.Location == 2) && Routes[1].Overloaded)
-                cause = !Routes[1].Open ? "Земля → Бастион закрыт." : Routes[1].Raided ? "Рейд снижает мощность Земля → Бастион вдвое." : "Земля → Бастион перегружен.";
+            int routeIndex = FleetSupplyRoute;
+            if (routeIndex >= 0 && Routes[routeIndex].Overloaded)
+            {
+                RouteState route = Routes[routeIndex];
+                cause = !route.Open ? route.Name + " закрыт." : route.Raided ? "Рейд снижает мощность " + route.Name + " вдвое." : route.Name + " перегружен.";
+            }
             double deficit = Fleet.Demand - Fleet.NetworkSupply;
             return cause + (Fleet.SupplyStock > 0 ? " Резерва хватит на " + (Fleet.SupplyStock / deficit).ToString("0.0") + " ч." : " Резерв исчерпан; организация падает.");
         }

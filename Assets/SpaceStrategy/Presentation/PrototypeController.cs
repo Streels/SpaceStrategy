@@ -13,6 +13,7 @@ namespace SpaceStrategy.Presentation
         private StrategySimulation simulation;
         private int selectedPlanet = 1;
         private int selectedRoute = 1;
+        private int selectedDestination = 1;
         private int speed = 1;
         private bool paused;
         private Font font;
@@ -36,15 +37,29 @@ namespace SpaceStrategy.Presentation
 
         private void Awake()
         {
+            Initialize();
+            if (Array.IndexOf(Environment.GetCommandLineArgs(), "--prototype-smoke") >= 0)
+                StartCoroutine(SmokeTest());
+        }
+
+        private void OnEnable()
+        {
+            // A script reload in Play mode discards this non-serialized test state.
+            // Reinitialize the stand instead of leaving OnGUI with null references.
+            if (simulation == null || font == null || stars == null) Initialize();
+        }
+
+        private void Initialize()
+        {
             simulation = new StrategySimulation();
             Application.runInBackground = true;
             Application.targetFrameRate = 60;
             font = Font.CreateDynamicFontFromOSFont(new[] { "Segoe UI", "Arial" }, 16);
             if (font == null) font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+            textStyles.Clear();
             GenerateTextures();
+            Application.logMessageReceived -= TrackErrors;
             Application.logMessageReceived += TrackErrors;
-            if (Array.IndexOf(Environment.GetCommandLineArgs(), "--prototype-smoke") >= 0)
-                StartCoroutine(SmokeTest());
         }
 
         private void TrackErrors(string message, string trace, LogType type)
@@ -86,7 +101,7 @@ namespace SpaceStrategy.Presentation
         private void DrawHeader()
         {
             Text(new Rect(36, 24, 700, 38), "SPACE STRATEGY", 29, Ink, true);
-            Text(new Rect(37, 68, 670, 24), "ПРОТОТИП 01  /  ЭКОНОМИКА И ЛОГИСТИКА", 12, Muted);
+            Text(new Rect(37, 68, 670, 24), "ТЕСТОВЫЙ СТЕНД 02  /  ЭКОНОМИКА И ЛОГИСТИКА", 12, Muted);
             int day = (int)(simulation.Hour / 24) + 1;
             Text(new Rect(760, 32, 290, 30), "День " + day + "  ·  " + ((int)simulation.Hour % 24).ToString("00") + ":00", 19, Ink);
             if (Button(new Rect(1060, 30, 110, 38), paused ? "Продолжить" : "Пауза", paused)) paused = !paused;
@@ -133,7 +148,7 @@ namespace SpaceStrategy.Presentation
             {
                 Vector2 p = Positions[i];
                 Rect hit = new Rect(p.x - 62, p.y - 62, 124, 158);
-                if (Pressed(hit)) selectedPlanet = i;
+                if (Pressed(hit)) { selectedPlanet = i; selectedDestination = i; }
                 GUI.color = selectedPlanet == i ? Teal : Border;
                 GUI.DrawTexture(new Rect(p.x - 55, p.y - 55, 110, 110), circle);
                 GUI.color = Background;
@@ -145,11 +160,12 @@ namespace SpaceStrategy.Presentation
                 Text(new Rect(p.x - 110, p.y + 96, 220, 22), detail, 13, i == 0 && !simulation.MiningEnabled ? Red : Muted, false, TextAnchor.MiddleCenter);
             }
             FleetState f = simulation.Fleet;
-            Vector2 fleetPosition = f.Travelling ? Vector2.Lerp(Positions[f.Origin], Positions[f.Destination], (float)f.TravelProgress) : Positions[f.Location] + new Vector2(-75, -74);
+            Vector2 fleetPosition = f.Travelling ? Vector2.Lerp(Positions[f.LegOrigin], Positions[f.LegDestination],
+                (float)(f.Mode == TransferMode.Route ? f.LegProgress : f.TravelProgress)) : Positions[f.Location] + new Vector2(-75, -74);
             GUI.color = f.SupplyRatio < 0.9 ? Amber : Teal;
             GUI.DrawTexture(new Rect(fleetPosition.x - 15, fleetPosition.y - 15, 30, 30), ship);
             Text(new Rect(fleetPosition.x + 22, fleetPosition.y - 12, 130, 24), "1-й флот", 13, Teal, true);
-            Text(new Rect(60, 610, 900, 22), "Нажмите на планету или маршрут. Цвет линии показывает состояние сети, точки — поток грузов.", 12, Muted);
+            Text(new Rect(60, 610, 900, 22), "Планета выбирает цель флота; команда — справа. Линии показывают состояние общих маршрутов.", 12, Muted);
         }
 
         private void DrawFleet()
@@ -163,19 +179,26 @@ namespace SpaceStrategy.Presentation
             Text(new Rect(1430, 202, 112, 26), Percent(f.SupplyRatio), 20, f.SupplyRatio < 0.9 ? Amber : Teal, true, TextAnchor.MiddleRight);
             Bar(new Rect(1082, 233, 460, 6), f.SupplyRatio, f.SupplyRatio < 0.9 ? Amber : Teal);
             Text(new Rect(1082, 249, 460, 22), "Поставки " + f.NetworkSupply.ToString("0.0") + " / расход " + f.Demand.ToString("0") + " в час  ·  запас " + f.SupplyStock.ToString("0") + " / 150", 12, Muted);
-            Text(new Rect(1082, 278, 460, 26), "Организация " + f.Organization.ToString("0") + "%     Топливо " + f.Fuel.ToString("0") + "%", 13, Ink);
-            if (f.Travelling) Bar(new Rect(1082, 309, 460, 4), f.TravelProgress, Teal);
-            bool canTravel = !f.Travelling && !simulation.ShipQueued;
-            if (Button(new Rect(1082, 332, 222, 32), "По маршруту · 6+ ч", false, canTravel && f.Fuel >= 10 && simulation.Routes[1].Open, 12)) simulation.Transfer(TransferMode.Route);
-            if (Button(new Rect(1316, 332, 226, 32), "Гиперпрыжок · 2 ч", false, canTravel && f.Fuel >= 30, 12)) simulation.Transfer(TransferMode.Hyperjump);
+            Text(new Rect(1082, 273, 460, 20), "Организация " + f.Organization.ToString("0") + "%     Топливо " + f.Fuel.ToString("0") + "%", 13, Ink);
+            if (f.Travelling) Bar(new Rect(1082, 294, 460, 3), f.TravelProgress, Teal);
+            for (int i = 0; i < simulation.Planets.Length; i++)
+                if (Button(new Rect(1082 + i * 156, 300, 148, 24), simulation.Planets[i].Name,
+                    selectedDestination == i, !f.Travelling, 11)) selectedDestination = i;
+            string routeReason = simulation.TransferBlockReason(selectedDestination, TransferMode.Route);
+            string jumpReason = simulation.TransferBlockReason(selectedDestination, TransferMode.Hyperjump);
+            string routeLabel = "По сети · " + simulation.MinimumTravelHours(selectedDestination, TransferMode.Route) + "+ ч / −"
+                + simulation.TransferFuelCost(selectedDestination, TransferMode.Route) + " топлива";
+            if (Button(new Rect(1082, 332, 222, 32), routeLabel, false, routeReason == null, 11)) simulation.Transfer(selectedDestination, TransferMode.Route);
+            if (Button(new Rect(1316, 332, 226, 32), "Гиперпрыжок · 2 ч / −30", false, jumpReason == null, 11)) simulation.Transfer(selectedDestination, TransferMode.Hyperjump);
+            if (!f.Travelling && routeReason != null) Text(new Rect(1082, 365, 460, 14), routeReason, 10, Muted);
         }
 
         private void DrawRoutes()
         {
             Box(new Rect(1060, 396, 504, 254));
             Text(new Rect(1082, 411, 350, 24), "УПРАВЛЕНИЕ МАРШРУТОМ", 13, Ink, true);
-            if (Button(new Rect(1082, 446, 220, 30), "Эридан IV → Земля", selectedRoute == 0, true, 12)) selectedRoute = 0;
-            if (Button(new Rect(1314, 446, 228, 30), "Земля → Бастион", selectedRoute == 1, true, 12)) selectedRoute = 1;
+            if (Button(new Rect(1082, 446, 220, 30), "Эридан IV ↔ Земля", selectedRoute == 0, true, 12)) selectedRoute = 0;
+            if (Button(new Rect(1314, 446, 228, 30), "Земля ↔ Бастион", selectedRoute == 1, true, 12)) selectedRoute = 1;
             RouteState r = simulation.Routes[selectedRoute];
             Text(new Rect(1082, 489, 460, 24), "Спрос " + r.Demand.ToString("0.0") + "   /   доступно " + r.EffectiveCapacity.ToString("0") + "   ·   доставляется " + Percent(r.DeliveryRatio), 13, r.Overloaded ? Amber : Teal);
             Text(new Rect(1082, 521, 150, 22), "Мощность: " + r.Capacity.ToString("0"), 12, Muted);
